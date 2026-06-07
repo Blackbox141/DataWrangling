@@ -1,8 +1,10 @@
+from pathlib import Path
 import pandas as pd
 import matplotlib.pyplot as plt
 import scipy.stats as stats
 
-df = pd.read_csv("/Users/dennis/Desktop/DataWrangling/cleaned_2024_data_ch_de.csv")
+_DATA = Path(__file__).parent / "data" / "cleaned_2024_data_ch_de.csv"
+df = pd.read_csv(_DATA)
 
 # Land ableiten
 df["Land"] = df["CantonCode"].str[-2:]
@@ -158,6 +160,6 @@ ax.legend(title="Schwere", bbox_to_anchor=(1, 1))
 
 plt.suptitle("Ziel 3: Winterunfälle CH vs. DE", fontsize=15, y=1.01, fontweight="bold")
 plt.tight_layout()
-plt.savefig("ziel3_winter.png", dpi=150, bbox_inches="tight")
+plt.savefig(Path(__file__).parent / "ziel3_winter.png", dpi=150, bbox_inches="tight")
 plt.show()
 print("Grafik gespeichert als: ziel3_winter.png")

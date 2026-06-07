@@ -13,8 +13,9 @@ from pathlib import Path
 import pandas as pd
 
 
-DEFAULT_INPUT_PATH = "/Users/dennis/Desktop/DataWrangling/merged.csv"
-DEFAULT_OUTPUT_PATH = "/Users/dennis/Desktop/DataWrangling/merged_2024.csv"
+_DATA_DIR = Path(__file__).parent / "data"
+DEFAULT_INPUT_PATH = str(_DATA_DIR / "merged.csv")
+DEFAULT_OUTPUT_PATH = str(_DATA_DIR / "merged_2024.csv")
 
 def main():
     parser = argparse.ArgumentParser()

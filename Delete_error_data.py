@@ -21,7 +21,7 @@ from pathlib import Path
 import pandas as pd
 
 
-DEFAULT_DATA_DIR = Path("/Users/dennis/Desktop/DataWrangling")
+DEFAULT_DATA_DIR = Path(__file__).parent / "data"
 DEFAULT_INPUT_PATH = DEFAULT_DATA_DIR / "merged.csv"
 DEFAULT_ERRORS_PATH = DEFAULT_DATA_DIR / "error_entries.csv"
 DEFAULT_WITHOUT_ERRORS_PATH = DEFAULT_DATA_DIR / "without_error_entries.csv"

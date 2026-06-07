@@ -11,7 +11,7 @@ import streamlit as st
 from merge_data import normalize_ch, normalize_de
 
 
-SAVE_DIR = Path("/Users/dennis/Desktop/DataWrangling")
+SAVE_DIR = Path(__file__).parent / "data"
 MERGED_PATH = SAVE_DIR / "workflow_01_merged_normalized.csv"
 ERROR_PATH = SAVE_DIR / "workflow_02_error_rows.csv"
 WITHOUT_ERRORS_PATH = SAVE_DIR / "workflow_03_clean_rows.csv"

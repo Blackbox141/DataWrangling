@@ -27,7 +27,7 @@ from typing import Iterable
 import pandas as pd
 
 
-DEFAULT_DATA_DIR = Path("/Users/dennis/Desktop/DataWrangling")
+DEFAULT_DATA_DIR = Path(__file__).parent / "data"
 DEFAULT_DE_PATH = DEFAULT_DATA_DIR / "RoadAccident_de.csv"
 DEFAULT_CH_PATH = DEFAULT_DATA_DIR / "RoadAccident_ch.csv"
 DEFAULT_OUT_PATH = DEFAULT_DATA_DIR / "merged.csv"

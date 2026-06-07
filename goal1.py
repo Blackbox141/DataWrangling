@@ -1,8 +1,10 @@
+from pathlib import Path
 import pandas as pd
 import matplotlib.pyplot as plt
 import scipy.stats as stats
 
-df = pd.read_csv("/Users/dennis/Desktop/DataWrangling/cleaned_2024_data_ch_de.csv")
+_DATA = Path(__file__).parent / "data" / "cleaned_2024_data_ch_de.csv"
+df = pd.read_csv(_DATA)
 
 # Land aus CantonCode ableiten (endet auf _CH oder _DE)
 df["Land"] = df["CantonCode"].str[-2:]
@@ -73,6 +75,6 @@ for ax, title, subset in zip(axes, titles, subsets):
 
 plt.suptitle("Unfallschwere nach Motorradbeteiligung", fontsize=14, y=1.02)
 plt.tight_layout()
-plt.savefig("ziel1_motorrad_schwere.png", dpi=150, bbox_inches="tight")
+plt.savefig(Path(__file__).parent / "ziel1_motorrad_schwere.png", dpi=150, bbox_inches="tight")
 plt.show()
 print("Grafik gespeichert als: ziel1_motorrad_schwere.png")
