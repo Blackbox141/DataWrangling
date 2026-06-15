@@ -1,21 +1,31 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
+import time
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Tuple
+from zoneinfo import ZoneInfo
 
 import pandas as pd
+import requests
 import streamlit as st
 
 from merge_data import normalize_ch, normalize_de
 
 
+PROJECT_ROOT = Path(__file__).parent.parent.parent
+PROCESSED_DATA_DIR = PROJECT_ROOT / "data" / "processed"
 SAVE_DIR = Path(__file__).parent / "data"
 MERGED_PATH = SAVE_DIR / "workflow_01_merged_normalized.csv"
 ERROR_PATH = SAVE_DIR / "workflow_02_error_rows.csv"
 WITHOUT_ERRORS_PATH = SAVE_DIR / "workflow_03_clean_rows.csv"
 CLEANED_2024_PATH = SAVE_DIR / "workflow_04_final_filtered.csv"
+NIGHT_PATH = SAVE_DIR / "workflow_05_night_classified.csv"
+TWILIGHT_CACHE_PATH = PROCESSED_DATA_DIR / "twilight_cache.json"
+API_URL = "https://api.sunrise-sunset.org/json"
 
 INTERNAL_TO_OUTPUT_COLUMNS = {
     "AccidentUID": "Accident_ID",
@@ -53,6 +63,7 @@ WORKFLOW_STEPS = [
     "3) Fehleranalyse",
     "4) Fehlerbereinigung",
     "5) Jahresfilter / Final",
+    "6) Nachtklassifikation / Ziel 5",
 ]
 
 TABLE_HANDLING = {
@@ -62,7 +73,48 @@ TABLE_HANDLING = {
     "Fehlerzeilen": "Zeilen mit fehlenden/ungültigen Werten, separat dokumentiert.",
     "Ohne Fehler": "Fehlerzeilen wurden herausgefiltert.",
     "Final (Jahr)": "Bereinigte Daten, zusätzlich auf gewähltes Jahr gefiltert.",
+    "Final + Nacht": "Finale Daten mit numerischer Unfallstunde und effektiver Nachtklassifikation.",
 }
+
+TZ_DE = ZoneInfo("Europe/Berlin")
+TZ_CH = ZoneInfo("Europe/Zurich")
+
+DE_COORDS: dict[str, tuple[float, float]] = {
+    "BW_DE": (48.6616, 9.3501),
+    "BY_DE": (48.9384, 11.4283),
+    "BE_DE": (52.5200, 13.4050),
+    "BB_DE": (52.4126, 12.5316),
+    "HB_DE": (53.0793, 8.8017),
+    "HH_DE": (53.5753, 10.0153),
+    "HE_DE": (50.6521, 9.1624),
+    "MV_DE": (53.6127, 12.4296),
+    "NI_DE": (52.6367, 9.8451),
+    "NW_DE": (51.4332, 7.6616),
+    "RP_DE": (50.1183, 7.3089),
+    "SL_DE": (49.3964, 7.0229),
+    "SN_DE": (51.1045, 13.2017),
+    "ST_DE": (51.9503, 11.6923),
+    "SH_DE": (54.2194, 9.6961),
+    "TH_DE": (50.9051, 11.0238),
+}
+
+CH_CENTER = (46.8182, 8.2275)
+
+MONTH_NAME_TO_NUM = {
+    "Jan": 1,
+    "Feb": 2,
+    "Mar": 3,
+    "Apr": 4,
+    "Mai": 5,
+    "Jun": 6,
+    "Jul": 7,
+    "Aug": 8,
+    "Sep": 9,
+    "Okt": 10,
+    "Nov": 11,
+    "Dez": 12,
+}
+MONTH_ORDER = list(MONTH_NAME_TO_NUM.keys())
 
 
 def setup_ui() -> None:
@@ -71,21 +123,55 @@ def setup_ui() -> None:
         """
         <style>
           .block-container {padding-top: 1.3rem; max-width: 1200px;}
-          .step {
-            border: 1px solid #dfe6ee;
-            border-radius: 14px;
-            padding: 16px 18px;
-            background: linear-gradient(145deg, #ffffff 0%, #f7fafc 100%);
-            margin-bottom: 12px;
+          .workflow-intro {
+            border-left: 4px solid var(--primary-color);
+            padding: 0.35rem 0 0.35rem 0.85rem;
+            margin: 0.4rem 0 1.1rem 0;
+            color: var(--text-color);
           }
-          .step h3 {margin: 0 0 8px 0; font-size: 1.05rem;}
-          .muted {color: #5a6675; font-size: 0.93rem;}
+          .step-header {
+            display: flex;
+            gap: 1rem;
+            align-items: baseline;
+            border-top: 1px solid rgba(128, 128, 128, 0.35);
+            padding: 1.1rem 0 0.45rem 0;
+            margin-top: 1rem;
+          }
+          .step-number {
+            color: var(--primary-color);
+            font-weight: 700;
+            min-width: 5.6rem;
+          }
+          .step-title {
+            font-size: 1.18rem;
+            font-weight: 700;
+            color: var(--text-color);
+          }
+          .step-detail {
+            margin: 0.1rem 0 0.35rem 0;
+            color: var(--text-color);
+            opacity: 0.72;
+            font-size: 0.93rem;
+          }
+          .cta-label {
+            color: var(--text-color);
+            font-weight: 700;
+            margin-top: 0.3rem;
+          }
         </style>
         """,
         unsafe_allow_html=True,
     )
     st.title("CH/DE Unfalldaten - GUI Workflow")
-    st.caption("Dateien laden, mergen, Fehler analysieren und bereinigen, danach Ziele auswerten.")
+    st.markdown(
+        """
+        <div class="workflow-intro">
+          Rohdaten laden, zu einer gemeinsamen Tabelle harmonisieren, bereinigen und danach die Zielanalysen auswerten.
+          Ziel 5 wird erst nach der zusätzlichen Nachtklassifikation verfügbar.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def read_uploaded_file(uploaded_file) -> pd.DataFrame:
@@ -171,6 +257,152 @@ def save_csv(df: pd.DataFrame, path: Path) -> None:
     df.to_csv(path, index=False)
 
 
+def build_hour_lookup(de_df: pd.DataFrame, ch_df: pd.DataFrame) -> pd.DataFrame:
+    required_de = {"UIDENTSTLAE", "USTUNDE"}
+    required_ch = {"AccidentUID", "AccidentHour"}
+    missing_de = sorted(required_de - set(de_df.columns))
+    missing_ch = sorted(required_ch - set(ch_df.columns))
+    if missing_de or missing_ch:
+        raise ValueError(f"Stundenspalten fehlen. DE: {missing_de}, CH: {missing_ch}")
+
+    de_hours = pd.DataFrame(
+        {
+            "AccidentUID": de_df["UIDENTSTLAE"].astype("string").str.strip(),
+            "AccidentHourNumeric": pd.to_numeric(de_df["USTUNDE"], errors="coerce").astype("Int64"),
+        }
+    )
+    ch_hours = pd.DataFrame(
+        {
+            "AccidentUID": ch_df["AccidentUID"].astype("string").str.strip(),
+            "AccidentHourNumeric": pd.to_numeric(ch_df["AccidentHour"], errors="coerce").astype("Int64"),
+        }
+    )
+    return (
+        pd.concat([ch_hours, de_hours], ignore_index=True)
+        .dropna(subset=["AccidentHourNumeric"])
+        .drop_duplicates(subset=["AccidentUID"])
+    )
+
+
+def add_numeric_hour(cleaned: pd.DataFrame, de_df: pd.DataFrame, ch_df: pd.DataFrame) -> pd.DataFrame:
+    if "AccidentUID" not in cleaned.columns:
+        raise ValueError("Pflichtspalte 'AccidentUID' fehlt in den finalen Daten.")
+
+    result = cleaned.copy()
+    result["AccidentUID"] = result["AccidentUID"].astype("string").str.strip()
+    result = result.merge(build_hour_lookup(de_df, ch_df), on="AccidentUID", how="left")
+
+    if "AccidentHour" in result.columns and "AccidentHourNumeric" in result.columns:
+        cols = list(result.columns)
+        cols.remove("AccidentHourNumeric")
+        cols.insert(cols.index("AccidentHour") + 1, "AccidentHourNumeric")
+        result = result[cols]
+    return result
+
+
+def load_twilight_cache() -> dict:
+    if TWILIGHT_CACHE_PATH.exists():
+        return json.loads(TWILIGHT_CACHE_PATH.read_text())
+    return {}
+
+
+def save_twilight_cache(cache: dict) -> None:
+    TWILIGHT_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    TWILIGHT_CACHE_PATH.write_text(json.dumps(cache, indent=2))
+
+
+def fetch_twilight(lat: float, lng: float, date_str: str, cache: dict) -> tuple[str, str]:
+    key = f"{lat},{lng},{date_str}"
+    if key in cache:
+        return cache[key]["begin"], cache[key]["end"]
+
+    response = requests.get(
+        API_URL,
+        params={"lat": lat, "lng": lng, "date": date_str, "formatted": 0},
+        timeout=15,
+    )
+    response.raise_for_status()
+    data = response.json()
+    if data.get("status") != "OK":
+        raise RuntimeError(f"API-Fehler für {date_str} ({lat}, {lng}): {data}")
+
+    begin = data["results"]["civil_twilight_begin"]
+    end = data["results"]["civil_twilight_end"]
+    cache[key] = {"begin": begin, "end": end}
+    save_twilight_cache(cache)
+    time.sleep(0.4)
+    return begin, end
+
+
+def utc_to_local_hour(utc_str: str, tz: ZoneInfo) -> int:
+    return datetime.fromisoformat(utc_str).astimezone(tz).hour
+
+
+def classify_night_accidents(df: pd.DataFrame, year: int) -> pd.DataFrame:
+    required = {"AccidentMonth", "CantonCode", "AccidentHourNumeric"}
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise ValueError(f"Pflichtspalten für Ziel 5 fehlen: {missing}")
+
+    result = df.copy()
+    result["_month_num"] = result["AccidentMonth"].map(MONTH_NAME_TO_NUM)
+    result["_is_ch"] = result["CantonCode"].astype("string").str.endswith("_CH")
+
+    if result["_month_num"].isna().any():
+        raise ValueError("Mindestens ein Monat konnte nicht gemappt werden.")
+    if result["AccidentHourNumeric"].isna().any():
+        raise ValueError("Nicht für alle Zeilen konnte die numerische Unfallstunde ergänzt werden.")
+
+    unique_pairs = result[["CantonCode", "_month_num", "_is_ch"]].drop_duplicates()
+    cache = load_twilight_cache()
+    twilight: dict[tuple[str, int], tuple[int, int]] = {}
+
+    for _, row in unique_pairs.iterrows():
+        code = str(row["CantonCode"])
+        month = int(row["_month_num"])
+        is_ch = bool(row["_is_ch"])
+        lat, lng = CH_CENTER if is_ch else DE_COORDS[code]
+        tz = TZ_CH if is_ch else TZ_DE
+        begin_utc, end_utc = fetch_twilight(lat, lng, f"{year}-{month:02d}-15", cache)
+        twilight[(code, month)] = (utc_to_local_hour(begin_utc, tz), utc_to_local_hour(end_utc, tz))
+
+    def classify(row) -> int:
+        dawn, dusk = twilight[(str(row["CantonCode"]), int(row["_month_num"]))]
+        hour = int(row["AccidentHourNumeric"])
+        return 1 if hour < dawn or hour > dusk else 0
+
+    result["NightAccident"] = result.apply(classify, axis=1)
+    return result.drop(columns=["_month_num", "_is_ch"])
+
+
+def monthly_daylight_hours(cache: dict, year: int) -> dict[str, float | None]:
+    daylight: dict[str, float | None] = {}
+    for month_name, month_num in MONTH_NAME_TO_NUM.items():
+        date_str = f"{year}-{month_num:02d}-15"
+        durations = []
+        for key, value in cache.items():
+            if key.endswith(date_str):
+                begin = datetime.fromisoformat(value["begin"])
+                end = datetime.fromisoformat(value["end"])
+                durations.append((end - begin).total_seconds() / 3600)
+        daylight[month_name] = sum(durations) / len(durations) if durations else None
+    return daylight
+
+
+def format_int_de(value: int) -> str:
+    return f"{value:,}".replace(",", ".")
+
+
+def format_percent_de(value: float) -> str:
+    return f"{value:.1f}".replace(".", ",") + " %"
+
+
+def format_hours_de(value: float | None) -> str:
+    if value is None:
+        return "-"
+    return f"{value:.1f}".replace(".", ",") + " h"
+
+
 def to_output_location(value: object) -> object:
     if pd.isna(value):
         return value
@@ -236,6 +468,7 @@ def render_sidebar_progress(
     error_df: pd.DataFrame | None,
     without_errors: pd.DataFrame | None,
     cleaned: pd.DataFrame | None,
+    night_df: pd.DataFrame | None,
 ) -> None:
     done = [
         base_loaded,
@@ -243,6 +476,7 @@ def render_sidebar_progress(
         error_df is not None,
         without_errors is not None,
         cleaned is not None,
+        night_df is not None,
     ]
     progress_value = sum(done) / len(done)
 
@@ -254,6 +488,7 @@ def render_sidebar_progress(
         "3) Fehleranalyse fertig",
         "4) Bereinigung fertig",
         "5) Jahr gefiltert",
+        "6) Nachtklassifikation fertig",
     ]
     for ok, label in zip(done, labels):
         st.sidebar.write(f"{'✅' if ok else '⬜'} {label}")
@@ -311,14 +546,33 @@ def render_quick_insights(df: pd.DataFrame, title: str) -> None:
 
 
 def render_step_info(step_title: str, text: str) -> None:
-    st.info(f"{step_title}: {text}")
+    st.caption(f"{step_title}: {text}")
 
 
-def render_goals_dashboard(df: pd.DataFrame | None) -> None:
+def render_step_header(step_number: int, title: str, detail: str) -> None:
+    st.markdown(
+        f"""
+        <div class="step-header">
+          <div class="step-number">Schritt {step_number}</div>
+          <div>
+            <div class="step-title">{title}</div>
+            <div class="step-detail">{detail}</div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_cta_label(text: str) -> None:
+    st.markdown(f'<div class="cta-label">{text}</div>', unsafe_allow_html=True)
+
+
+def render_goals_dashboard(df: pd.DataFrame | None, night_df: pd.DataFrame | None) -> None:
     st.markdown("---")
     st.subheader("Ziele (Abschlussanalyse)")
     if df is None or df.empty:
-        st.info("Die Zielanalyse wird aktiv, sobald Schritt 5 (Jahresfilter) abgeschlossen ist.")
+        st.caption("Die Zielanalyse wird aktiv, sobald Schritt 5 abgeschlossen ist.")
         return
 
     weekday_order = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
@@ -330,7 +584,7 @@ def render_goals_dashboard(df: pd.DataFrame | None) -> None:
     mc = pd.to_numeric(df["AccidentInvolvingMotorcycle"], errors="coerce")
     is_mc = mc == 1
 
-    tabs = st.tabs(["Ziel 1", "Ziel 2", "Ziel 3", "Ziel 4"])
+    tabs = st.tabs(["Ziel 1", "Ziel 2", "Ziel 3", "Ziel 4", "Ziel 5"])
 
     with tabs[0]:
         st.write("**Ziel 1:** Gibt es einen Zusammenhang zwischen Motorradbeteiligung und der Schwere von Unfällen (insbesondere Todesfällen)?")
@@ -377,6 +631,48 @@ def render_goals_dashboard(df: pd.DataFrame | None) -> None:
         st.write("**Diagramm 2: Tödlichkeitsrate pro Wochentag in %**")
         st.bar_chart(fatal_rate.rename_axis("Wochentag").to_frame("Toedlichkeitsrate_Prozent"), use_container_width=True)
 
+    with tabs[4]:
+        st.write("**Ziel 5: Auswirkung Winterzeit**")
+        if night_df is None or night_df.empty or "NightAccident" not in night_df.columns:
+            st.caption("Ziel 5 wird aktiv, sobald Schritt 6 abgeschlossen ist.")
+            return
+
+        night = night_df.copy()
+        analysis_year = int(st.session_state.get("analysis_year", 2024))
+        daylight = monthly_daylight_hours(load_twilight_cache(), analysis_year)
+
+        total_counts = night["AccidentMonth"].value_counts().reindex(MONTH_ORDER, fill_value=0)
+
+        rows = []
+        for month in MONTH_ORDER:
+            month_df = night[night["AccidentMonth"] == month]
+            api_night = month_df["NightAccident"] == 1
+            bin_night = month_df["AccidentHour"] == "Nacht"
+
+            total = int(total_counts[month])
+            bin_count = int(bin_night.sum())
+            api_count = int(api_night.sum())
+            both_count = int((bin_night & api_night).sum())
+            only_api = int((~bin_night & api_night).sum())
+            only_bin = int((bin_night & ~api_night).sum())
+            api_rate = (api_count / total * 100) if total else 0.0
+            rows.append(
+                {
+                    "Monat": month,
+                    "Tageslicht (h)": format_hours_de(daylight[month]),
+                    "Bin Nacht": format_int_de(bin_count),
+                    "API effektiv Nacht": format_int_de(api_count),
+                    "Beide Nacht": format_int_de(both_count),
+                    "Nur API Nacht": format_int_de(only_api),
+                    "Nur Bin Nacht": format_int_de(only_bin),
+                    "Gesamt": format_int_de(total),
+                    "API Anteil": format_percent_de(api_rate),
+                }
+            )
+
+        st.caption("Monatlicher Vergleich: ursprünglicher Uhrzeit-Bin `Nacht` vs. API-klassifizierte effektive Nacht (`NightAccident = 1`).")
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
 
 def build_table_registry(
     de_df: pd.DataFrame | None,
@@ -385,6 +681,7 @@ def build_table_registry(
     error_df: pd.DataFrame | None,
     without_errors: pd.DataFrame | None,
     cleaned: pd.DataFrame | None,
+    night_df: pd.DataFrame | None,
 ) -> Dict[str, pd.DataFrame]:
     tables: Dict[str, pd.DataFrame] = {}
     if de_df is not None:
@@ -399,6 +696,8 @@ def build_table_registry(
         tables["Ohne Fehler"] = without_errors
     if cleaned is not None:
         tables["Final (Jahr)"] = cleaned
+    if night_df is not None:
+        tables["Final + Nacht"] = night_df
     return tables
 
 
@@ -440,8 +739,11 @@ def infer_current_step(
     merged_df: pd.DataFrame | None,
     error_df: pd.DataFrame | None,
     without_errors: pd.DataFrame | None,
+    night_df: pd.DataFrame | None,
     base_loaded: bool,
 ) -> str:
+    if night_df is not None:
+        return WORKFLOW_STEPS[5]
     if without_errors is not None:
         return WORKFLOW_STEPS[3]
     if error_df is not None:
@@ -471,7 +773,7 @@ def render_documentation_dashboard(tables: Dict[str, pd.DataFrame], current_step
 
     available_names = list(tables.keys())
     if not available_names:
-        st.info("Noch keine Tabelle verfügbar. Lade zuerst DE- und CH-Datei hoch.")
+        st.caption("Noch keine Tabelle verfügbar. Lade zuerst DE- und CH-Datei hoch.")
         return
 
     default_table_by_step = {
@@ -480,6 +782,7 @@ def render_documentation_dashboard(tables: Dict[str, pd.DataFrame], current_step
         WORKFLOW_STEPS[2]: "Fehlerzeilen",
         WORKFLOW_STEPS[3]: "Ohne Fehler",
         WORKFLOW_STEPS[4]: "Final (Jahr)",
+        WORKFLOW_STEPS[5]: "Final + Nacht",
     }
 
     default_table = default_table_by_step.get(current_step, available_names[0])
@@ -550,21 +853,15 @@ def main() -> None:
     st.sidebar.header("Workflow-Status")
     persist_to_disk = st.sidebar.checkbox("CSV-Ergebnisse lokal speichern", value=False)
 
-    st.info(
-        "Kurzanleitung: 1) Lade `RoadAccident_de.csv` und `RoadAccident_ch.csv` hoch. "
-        "2) Führe Merge, Fehlercheck, Bereinigung und Jahresfilter aus. "
-        "3) Öffne danach die 4 Ziel-Analysen am Ende des Workflows."
-    )
-
     de_df = None
     ch_df = None
     base_loaded = False
 
-    with st.container(border=True):
-        st.markdown("<div class='step'><h3>1) Daten laden (Drag-and-Drop)</h3><div class='muted'>Bitte RoadAccident_de.csv und RoadAccident_ch.csv hochladen.</div></div>", unsafe_allow_html=True)
-        render_step_info(
-            "Schritt 1",
-            "Hier lädst du die beiden Quelldateien hoch. Danach kann der gemeinsame Datensatz erzeugt werden.",
+    with st.container():
+        render_step_header(
+            1,
+            "Rohdaten laden",
+            "Lade die DE- und CH-Datei hoch. Danach werden die weiteren Aktionen freigeschaltet.",
         )
         col1, col2 = st.columns(2)
         with col1:
@@ -581,7 +878,7 @@ def main() -> None:
             st.error(f"Fehler beim Lesen der Dateien: {exc}")
             de_df, ch_df = None, None
     else:
-        st.info("Bitte beide Dateien hochladen: `RoadAccident_de.csv` und `RoadAccident_ch.csv`.")
+        st.caption("Warte auf beide Rohdateien: `RoadAccident_de.csv` und `RoadAccident_ch.csv`.")
 
     if de_df is not None and ch_df is not None:
         with st.expander("Vorschau Eingabedaten", expanded=False):
@@ -591,14 +888,14 @@ def main() -> None:
             with c2:
                 st.write("CH", ch_df.head(5))
 
-        with st.container(border=True):
-            st.markdown("<div class='step'><h3>2) Mergen & normalisieren</h3><div class='muted'>Erstellt die einheitliche Basistabelle.</div></div>", unsafe_allow_html=True)
-            render_step_info(
-                "Schritt 2",
-                "Die Spalten von DE und CH werden harmonisiert und zu einer Basis-Tabelle zusammengeführt.",
+        with st.container():
+            render_step_header(
+                2,
+                "Merge und Normalisierung",
+                "Erzeugt aus beiden Rohdaten eine gemeinsame Basistabelle mit einheitlichen Spalten.",
             )
-            st.caption("Pflichtaktion für den Workflow")
-            if st.button("Merge ausführen", type="primary", use_container_width=True):
+            render_cta_label("Nächste Aktion")
+            if st.button("Merge & Normalisierung ausführen", type="primary", use_container_width=True):
                 try:
                     merged = pd.concat([normalize_de(de_df), normalize_ch(ch_df)], ignore_index=True)
                     merged["AccidentYear"] = pd.to_numeric(merged["AccidentYear"], errors="coerce").astype("Int64")
@@ -610,6 +907,7 @@ def main() -> None:
                     st.session_state.pop("problem_mask", None)
                     st.session_state.pop("without_errors", None)
                     st.session_state.pop("cleaned", None)
+                    st.session_state.pop("night_df", None)
                     if persist_to_disk:
                         save_csv(to_output_schema(merged), MERGED_PATH)
                         st.success(f"Merge erfolgreich. Gespeichert: {MERGED_PATH}")
@@ -634,21 +932,24 @@ def main() -> None:
                 type="secondary",
             )
 
-    with st.container(border=True):
-        st.markdown("<div class='step'><h3>3) Fehlerzeilen erkennen</h3><div class='muted'>Erstellt error_entries.csv.</div></div>", unsafe_allow_html=True)
-        render_step_info(
-            "Schritt 3",
-            "Die Basis-Tabelle wird auf fehlende oder ungültige Werte geprüft. Auffällige Zeilen werden als Fehlerliste markiert.",
+    with st.container():
+        render_step_header(
+            3,
+            "Fehlerzeilen prüfen",
+            "Markiert Zeilen mit fehlenden oder ungültigen Werten für die Bereinigung.",
         )
         can_check_errors = merged_df is not None and has_required_columns(merged_df)
         if merged_df is not None and not has_required_columns(merged_df):
             st.warning("Basis-Tabelle hat nicht alle Pflichtspalten für die Fehleranalyse. Dokumentations-Übersicht bleibt trotzdem verfügbar.")
-        st.caption("Pflichtaktion für den Workflow")
-        if st.button("Fehler prüfen", type="primary", disabled=not can_check_errors, use_container_width=True):
+        render_cta_label("Nächste Aktion")
+        if st.button("Fehlerzeilen prüfen", type="primary", disabled=not can_check_errors, use_container_width=True):
             try:
                 error_df, problem_mask = find_error_entries(merged_df)
                 st.session_state["error_df"] = error_df
                 st.session_state["problem_mask"] = problem_mask
+                st.session_state.pop("without_errors", None)
+                st.session_state.pop("cleaned", None)
+                st.session_state.pop("night_df", None)
                 if persist_to_disk:
                     save_csv(to_output_schema(error_df), ERROR_PATH)
                     st.success(f"Fehlercheck fertig. {len(error_df):,} Fehlerzeilen gespeichert: {ERROR_PATH}")
@@ -673,17 +974,19 @@ def main() -> None:
                 type="secondary",
             )
 
-    with st.container(border=True):
-        st.markdown("<div class='step'><h3>4) Fehler entfernen</h3><div class='muted'>Erstellt without_error_entries.csv.</div></div>", unsafe_allow_html=True)
-        render_step_info(
-            "Schritt 4",
-            "Alle als fehlerhaft markierten Zeilen werden entfernt. Das Ergebnis ist die bereinigte Tabelle für weitere Auswertungen.",
+    with st.container():
+        render_step_header(
+            4,
+            "Fehler entfernen",
+            "Entfernt die markierten Fehlerzeilen und erzeugt die bereinigte Arbeitstabelle.",
         )
         can_remove = problem_mask is not None and merged_df is not None
-        st.caption("Pflichtaktion für den Workflow")
-        if st.button("Fehlerdaten entfernen", type="primary", disabled=not can_remove, use_container_width=True):
+        render_cta_label("Nächste Aktion")
+        if st.button("Fehlerzeilen entfernen", type="primary", disabled=not can_remove, use_container_width=True):
             without_errors = merged_df.loc[~problem_mask].copy()
             st.session_state["without_errors"] = without_errors
+            st.session_state.pop("cleaned", None)
+            st.session_state.pop("night_df", None)
             if persist_to_disk:
                 save_csv(to_output_schema(without_errors), WITHOUT_ERRORS_PATH)
                 st.success(f"Bereinigt gespeichert: {WITHOUT_ERRORS_PATH}")
@@ -704,19 +1007,21 @@ def main() -> None:
                 type="secondary",
             )
 
-    with st.container(border=True):
-        st.markdown("<div class='step'><h3>5) Jahr filtern</h3><div class='muted'>Erstellt die finale Tabelle für die Zielauswertung.</div></div>", unsafe_allow_html=True)
-        render_step_info(
-            "Schritt 5",
-            "Die bereinigten Daten werden auf ein Zieljahr reduziert. Diese finale Tabelle ist die Basis für die 4 Ziele.",
+    with st.container():
+        render_step_header(
+            5,
+            "Analysejahr wählen",
+            "Filtert die bereinigten Daten auf ein Jahr. Diese Tabelle ist die Basis für Ziele 1 bis 4 und für Schritt 6.",
         )
         year = st.number_input("Jahr", min_value=1900, max_value=2100, value=2024, step=1)
         can_filter = without_errors is not None
-        st.caption("Pflichtaktion für den Workflow")
-        if st.button("Jahresfilter anwenden", type="primary", disabled=not can_filter, use_container_width=True):
+        render_cta_label("Nächste Aktion")
+        if st.button("Auf Analysejahr filtern", type="primary", disabled=not can_filter, use_container_width=True):
             year_num = pd.to_numeric(without_errors["AccidentYear"], errors="coerce").astype("Int64")
             cleaned = without_errors.loc[year_num == int(year)].copy()
             st.session_state["cleaned"] = cleaned
+            st.session_state["analysis_year"] = int(year)
+            st.session_state.pop("night_df", None)
             if persist_to_disk:
                 save_csv(to_output_schema(cleaned), CLEANED_2024_PATH)
                 st.success(f"Final gespeichert: {CLEANED_2024_PATH}")
@@ -737,15 +1042,54 @@ def main() -> None:
                 type="secondary",
             )
 
+    with st.container():
+        render_step_header(
+            6,
+            "Ziel 5 vorbereiten",
+            "Ergänzt die originale Unfallstunde und berechnet effektive Nachtunfälle anhand bürgerlicher Dämmerungszeiten.",
+        )
+        can_prepare_night = cleaned is not None and de_df is not None and ch_df is not None
+        if cleaned is not None and (de_df is None or ch_df is None):
+            st.warning("Für Ziel 5 werden zusätzlich die hochgeladenen Rohdaten benötigt, damit die numerische Unfallstunde ergänzt werden kann.")
+        render_cta_label("Nächste Aktion für Ziel 5")
+        if st.button("Nachtklassifikation berechnen", type="primary", disabled=not can_prepare_night, use_container_width=True):
+            try:
+                analysis_year = int(st.session_state.get("analysis_year", year))
+                with_hour = add_numeric_hour(cleaned, de_df, ch_df)
+                night_df = classify_night_accidents(with_hour, analysis_year)
+                st.session_state["night_df"] = night_df
+                if persist_to_disk:
+                    save_csv(to_output_schema(night_df), NIGHT_PATH)
+                    st.success(f"Nachtklassifikation fertig. Gespeichert: {NIGHT_PATH}")
+                else:
+                    st.success("Nachtklassifikation fertig (nur im Arbeitsspeicher).")
+            except Exception as exc:
+                st.error(f"Nachtklassifikation fehlgeschlagen: {exc}")
+
+    night_df = st.session_state.get("night_df")
+    if night_df is not None:
+        night_export = to_output_schema(night_df)
+        st.dataframe(night_export.head(15), use_container_width=True)
+        with st.expander("Optional: Export", expanded=False):
+            st.download_button(
+                "workflow_05_night_classified.csv herunterladen",
+                data=to_csv_bytes(night_export),
+                file_name="workflow_05_night_classified.csv",
+                mime="text/csv",
+                use_container_width=True,
+                type="secondary",
+            )
+
     render_sidebar_progress(
         base_loaded=base_loaded,
         merged_df=merged_df,
         error_df=error_df,
         without_errors=without_errors,
         cleaned=cleaned,
+        night_df=night_df,
     )
 
-    render_goals_dashboard(cleaned)
+    render_goals_dashboard(cleaned, night_df)
 
     if persist_to_disk:
         st.caption(f"Lokaler Speicherpfad: {SAVE_DIR}")

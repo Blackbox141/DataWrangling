@@ -3,7 +3,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import scipy.stats as stats
 
-_DATA = Path(__file__).parent / "data" / "cleaned_2024_data_ch_de.csv"
+_ROOT = Path(__file__).parent.parent.parent
+_DATA = _ROOT / "data" / "processed" / "cleaned_2024_data_ch_de.csv"
 df = pd.read_csv(_DATA)
 
 # Land ableiten
@@ -147,6 +148,6 @@ ax.legend()
 
 plt.suptitle("Ziel 2: Unfälle nach Tageszeit", fontsize=15, y=1.01, fontweight="bold")
 plt.tight_layout()
-plt.savefig(Path(__file__).parent / "ziel2_tageszeit.png", dpi=150, bbox_inches="tight")
+plt.savefig(_ROOT / "plots" / "ziel2_tageszeit.png", dpi=150, bbox_inches="tight")
 plt.show()
 print("Grafik gespeichert als: ziel2_tageszeit.png")

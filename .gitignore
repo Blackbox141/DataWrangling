@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 .DS_Store
 data/raw/Data_CH/unfaelle-personenschaeden_alle_2056.csv/RoadTrafficAccidentLocations.csv
+.venv/
+.idea/
